@@ -1,76 +1,55 @@
 #!/bin/bash
 
 # ===============================================================
-# 基础配置
+# acme.sh 群晖自动证书申请与部署脚本 (主执行逻辑)
+# ===============================================================
+#
+# 【群晖任务计划执行指南】
+# 请在群晖 DSM 依次点击：“控制面板” -> “任务计划” -> “新增” -> “计划的任务” -> “用户定义的脚本”。
+# 建议将任务的运行频率设置为：每月运行一次（例如每月 1 日凌晨 2 点）。
+#
+# 👉 【用法一：单域名默认执行】 (脚本会自动寻找同目录下的 config.conf)
+# bash /volume1/docker/acme.sh/auto/acme.sh >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
+#
+# 👉 【用法二：多域名复用执行】 (通过后缀指定不同的配置文件，全部输出到同一个日志)
+# 域名 A:
+# bash /volume1/docker/acme.sh/auto/acme.sh /volume1/docker/acme.sh/auto/config_aaa.conf >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
+# 域名 B:
+# bash /volume1/docker/acme.sh/auto/acme.sh /volume1/docker/acme.sh/auto/config_bbb.conf >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
 # ===============================================================
 
-# 你的域名
-DOMAIN=''
-
-# 证书供应商 (例如: letsencrypt, buypass, zerossl)
-CERT_SERVER='letsencrypt'
-
-# DNS 供应商:
-# dns_cf (Cloudflare)
-# dns_dp (腾讯云 DNSPOD)
-# dns_ali (阿里云)
-# 更多请查阅: https://github.com/acmesh-official/acme.sh/wiki/dnsapi
-DNS=""
-
-
 # ===============================================================
-# DNS API 凭证
-# 根据上面选择的 DNS 供应商，填写对应的凭证
+# 1. 动态加载外部配置文件 (支持参数传入)
 # ===============================================================
 
-# --- Cloudflare (新版 API Token) ---
-# 请确保 Token 拥有 Zone.Zone 和 Zone.DNS 的编辑权限
-CF_Token=""
-CF_Account_ID=""
-CF_Zone_ID=""   # 可选，但建议填写以提高验证效率
+# 检查执行脚本时是否附带了配置文件参数 (例如 $1 就是你传入的配置文件路径)
+if [ -n "$1" ]; then
+    CONFIG_FILE="$1"
+else
+    # 如果没有参数，就默认使用脚本所在目录下的 config.conf
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    CONFIG_FILE="${SCRIPT_DIR}/config.conf"
+fi
 
-# --- 腾讯云 DNSPOD.CN ---
-DP_Id=''
-DP_Key=''
-
-# --- 阿里云 ---
-Ali_Key=''
-Ali_Secret=''
-
-
-# ===============================================================
-# 群晖 (Synology) 部署配置
-# ===============================================================
-
-# 群晖账号密码
-SYNO_Username=''
-SYNO_Password=''
-
-# 如果开启了双重验证(2FA)，请在浏览器登录DSM时选中“记住此设备”，
-# 然后从浏览器 Cookie 中获取 'id' 的值填入下方
-SYNO_Device_ID=''
-
-# 以下群晖连接配置，若非特殊情况请勿更改
-# 建议使用 localhost 避免网络回环问题导致 API 无法连接
-SYNO_Hostname=""
-SYNO_Scheme=""
-SYNO_Port=""
-
-# 要更新的证书名称。
-# 使用空字符串("")代表替代DSM中的“默认证书”，这是最常见的用法。
-SYNO_Certificate=''
-
+# 检查配置文件是否存在并加载
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+    echo "================================================="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 成功加载配置: $CONFIG_FILE"
+else
+    echo "================================================="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ 错误: 找不到指定的配置文件 '$CONFIG_FILE'"
+    exit 1
+fi
 
 # ===============================================================
-# 智能执行脚本 (自动判断 Issue / Renew，无需修改以下内容)
+# 2. 智能执行脚本 (自动判断 Issue / Renew)
 # ===============================================================
 
-echo "================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始处理域名: ${DOMAIN}"
+echo "开始处理域名: ${DOMAIN}"
 echo "准备执行 acme.sh 脚本..."
-echo "================================================="
 
-# 1. 根据选择的DNS服务商，准备对应的环境变量
+# 根据选择的DNS服务商，准备对应的环境变量，使用数组防止空格引发错误
 declare -a DNS_ENV_VARS
 case $DNS in
 "dns_cf")
@@ -86,7 +65,7 @@ case $DNS in
   DNS_ENV_VARS=("-e" "Ali_Key=${Ali_Key}" "-e" "Ali_Secret=${Ali_Secret}")
   ;;
 *)
-  echo "错误: 未知的 DNS 供应商 [${DNS}]。请检查脚本顶部的 DNS 配置。"
+  echo "❌ 错误: 未知的 DNS 供应商 [${DNS}]。请检查配置文件中的 DNS 设置。"
   exit 1
   ;;
 esac
@@ -97,14 +76,13 @@ ACTION_NEEDED="none"
 # ★ 核心判断：检查 acme.sh 内部是否已经存在该域名的配置 ★
 CHECK_EXIST=$(docker exec acme.sh acme.sh --list | grep "${DOMAIN}")
 
-# 2. 申请或续签证书
 if [ -z "$CHECK_EXIST" ]; then
     # -----------------------------------------------------------
     # 分支 A：未找到记录 -> 执行首次申请 (Issue)
     # -----------------------------------------------------------
-    echo " 检查结果：未检测到 ${DOMAIN} 的证书记录。"
-    echo "正在为域名 ${DOMAIN} 申请/续签证书..."
-    echo " 准备执行首次申请 (--issue)..."
+    echo "🔎 检查结果：未检测到 ${DOMAIN} 的证书记录。"
+    echo "正在为域名 ${DOMAIN} 申请证书..."
+    echo "🚀 准备执行首次申请 (--issue)..."
     
     docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
       --server "${CERT_SERVER}" \
@@ -124,9 +102,9 @@ else
     # -----------------------------------------------------------
     # 分支 B：找到记录 -> 执行续签逻辑 (Renew)
     # -----------------------------------------------------------
-    echo " 检查结果：检测到 ${DOMAIN} 已存在证书记录。"
-    echo "正在为域名 ${DOMAIN} 申请/续签证书..."
-    echo " 准备执行续签检查 (--renew)..."
+    echo "🔎 检查结果：检测到 ${DOMAIN} 已存在证书记录。"
+    echo "正在为域名 ${DOMAIN} 检查续签状态..."
+    echo "👉 准备执行续签检查 (--renew)..."
     
     docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
       --server "${CERT_SERVER}" \
@@ -140,7 +118,8 @@ else
         ACTION_NEEDED="deploy"
     elif [ $ACME_STATUS -eq 2 ]; then
         echo "⏳ 当前证书有效期依然充足（剩余大于30天），acme.sh 自动跳过更新。"
-        echo " 本次任务圆满结束，脚本执行完毕，无需进一步操作。"
+        echo "🎉 本次任务圆满结束，脚本执行完毕，无需进一步操作。"
+        echo "================================================="
         exit 0
     else
         echo "❌ 续签遇到错误 (状态码: ${ACME_STATUS})，请检查上面的日志输出。"
@@ -148,10 +127,13 @@ else
     fi
 fi
 
+# ===============================================================
 # 3. 部署证书到群晖
+# ===============================================================
+
 # 检查上一步证书申请是否成功并且需要部署
 if [ "$ACTION_NEEDED" == "deploy" ]; then
-    echo "证书申请成功，准备部署到 Synology DSM..."
+    echo "证书准备就绪，准备部署到 Synology DSM..."
     
     docker exec \
       -e SYNO_Username="${SYNO_Username}" \
@@ -164,9 +146,12 @@ if [ "$ACTION_NEEDED" == "deploy" ]; then
       acme.sh acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
       
     if [ $? -eq 0 ]; then
-        echo " 恭喜！新证书已成功部署并应用到群晖系统！脚本执行完毕。"
+        echo "🎉 恭喜！新证书已成功部署并应用到群晖系统！"
     else
         echo "❌ 证书部署到群晖失败，请检查账号密码、Device_ID 等变量是否正确。"
         exit 1
     fi
 fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 脚本运行完毕。"
+echo "================================================="
