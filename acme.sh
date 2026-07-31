@@ -19,27 +19,52 @@
 # ===============================================================
 
 # ===============================================================
-# 1. 动态加载外部配置文件 (支持参数传入，支持 config 文件夹)
+# 1. 动态加载外部配置文件 (支持参数传入、config文件夹及智能回退)
 # ===============================================================
 
-# 检查执行脚本时是否附带了配置文件参数 (例如 $1 就是你传入的配置文件路径)
+# 获取当前脚本所在的绝对路径
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# 初始化一个回退标记，用于后续输出日志
+FALLBACK_TRIGGERED=false
+
+# --- 1.1 确定配置文件的路径 ---
 if [ -n "$1" ]; then
+    # 场景 A: 明确传入了参数，直接使用传入的路径
     CONFIG_FILE="$1"
 else
-    # 如果没有参数，就默认寻找当前脚本目录下 config 文件夹内的 config.conf
-    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-    CONFIG_FILE="${SCRIPT_DIR}/config/config.conf"
+    # 场景 B: 没有传入参数，启动自动寻找机制
+    if [ -f "${SCRIPT_DIR}/config/config.conf" ]; then
+        # 优先级 1: 寻找 config 文件夹内的配置文件（理想状态）
+        CONFIG_FILE="${SCRIPT_DIR}/config/config.conf"
+    elif [ -f "${SCRIPT_DIR}/config.conf" ]; then
+        # 优先级 2: 触发智能回退，寻找与脚本同目录的配置文件
+        CONFIG_FILE="${SCRIPT_DIR}/config.conf"
+        FALLBACK_TRIGGERED=true
+    else
+        # 两个位置都没找到，将其置空以便触发下方的报错机制
+        CONFIG_FILE=""
+    fi
 fi
 
-# 检查配置文件是否存在并加载
-if [ -f "$CONFIG_FILE" ]; then
+# --- 1.2 验证并加载配置文件 ---
+if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
     echo "================================================="
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 成功加载配置: $CONFIG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ 成功加载配置: $CONFIG_FILE"
+    
+    # 如果触发了回退机制，打印一句友好的提示日志
+    if [ "$FALLBACK_TRIGGERED" = true ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️ 提示: 未在 config 目录找到配置文件，已智能回退加载同目录下的文件。"
+    fi
 else
     echo "================================================="
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ 错误: 找不到指定的配置文件 '$CONFIG_FILE'"
-    echo "请确保文件存在，且路径正确。"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ 致命错误: 无法找到配置文件！"
+    echo "请检查以下情况之一："
+    echo "1. 若您在计划任务中指定了配置文件路径，请检查该路径是否正确输入。"
+    echo "2. 若您使用默认执行，请确保在以下任一位置存在配置文件："
+    echo "   - 推荐位置: ${SCRIPT_DIR}/config/config.conf"
+    echo "   - 备选位置: ${SCRIPT_DIR}/config.conf"
     exit 1
 fi
 
