@@ -51,6 +51,7 @@ SYNO_Password=''
 SYNO_Device_ID=''
 
 # 以下群晖连接配置，若非特殊情况请勿更改
+# 建议使用 localhost 避免网络回环问题导致 API 无法连接
 SYNO_Hostname=""
 SYNO_Scheme=""
 SYNO_Port=""
@@ -61,25 +62,28 @@ SYNO_Certificate=''
 
 
 # ===============================================================
-# 执行脚本 (无需修改以下内容)
+# 智能执行脚本 (自动判断 Issue / Renew，无需修改以下内容)
 # ===============================================================
 
+echo "================================================="
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始处理域名: ${DOMAIN}"
 echo "准备执行 acme.sh 脚本..."
+echo "================================================="
 
 # 1. 根据选择的DNS服务商，准备对应的环境变量
-DNS_ENV_VARS=""
+declare -a DNS_ENV_VARS
 case $DNS in
 "dns_cf")
   echo "使用 Cloudflare (dns_cf) 进行验证。"
-  DNS_ENV_VARS="-e CF_Token=${CF_Token} -e CF_Account_ID=${CF_Account_ID} -e CF_Zone_ID=${CF_Zone_ID}"
+  DNS_ENV_VARS=("-e" "CF_Token=${CF_Token}" "-e" "CF_Account_ID=${CF_Account_ID}" "-e" "CF_Zone_ID=${CF_Zone_ID}")
   ;;
 "dns_dp")
   echo "使用 腾讯云 DNSPOD (dns_dp) 进行验证。"
-  DNS_ENV_VARS="-e DP_Id=${DP_Id} -e DP_Key=${DP_Key}"
+  DNS_ENV_VARS=("-e" "DP_Id=${DP_Id}" "-e" "DP_Key=${DP_Key}")
   ;;
 "dns_ali")
   echo "使用 阿里云 (dns_ali) 进行验证。"
-  DNS_ENV_VARS="-e Ali_Key=${Ali_Key} -e Ali_Secret=${Ali_Secret}"
+  DNS_ENV_VARS=("-e" "Ali_Key=${Ali_Key}" "-e" "Ali_Secret=${Ali_Secret}")
   ;;
 *)
   echo "错误: 未知的 DNS 供应商 [${DNS}]。请检查脚本顶部的 DNS 配置。"
@@ -87,32 +91,82 @@ case $DNS in
   ;;
 esac
 
-# 2. 申请或续签证书
-echo "正在为域名 ${DOMAIN} 申请/续签证书..."
-# shellcheck disable=SC2086
-docker exec ${DNS_ENV_VARS} acme.sh acme.sh \
-  --server "${CERT_SERVER}" \
-  --issue -d "${DOMAIN}" -d "*.${DOMAIN}" \
-  --dns "${DNS}" \
-  --log
+# 动作标记，决定最后是否需要部署到群晖
+ACTION_NEEDED="none"
 
-# 3. 部署证书到群晖
-# 检查上一步证书申请是否成功
-if [ $? -eq 0 ]; then
-  echo "证书申请成功，准备部署到 Synology DSM..."
-  docker exec \
-    -e SYNO_Username="${SYNO_Username}" \
-    -e SYNO_Password="${SYNO_Password}" \
-    -e SYNO_Device_ID="${SYNO_Device_ID}" \
-    -e SYNO_Hostname="${SYNO_Hostname}" \
-    -e SYNO_Scheme="${SYNO_Scheme}" \
-    -e SYNO_Port="${SYNO_Port}" \
-    -e SYNO_Certificate="${SYNO_Certificate}" \
-    -e SYNO_DID="${SYNO_Device_ID}" \
-    acme.sh acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
+# ★ 核心判断：检查 acme.sh 内部是否已经存在该域名的配置 ★
+CHECK_EXIST=$(docker exec acme.sh acme.sh --list | grep "${DOMAIN}")
+
+# 2. 申请或续签证书
+if [ -z "$CHECK_EXIST" ]; then
+    # -----------------------------------------------------------
+    # 分支 A：未找到记录 -> 执行首次申请 (Issue)
+    # -----------------------------------------------------------
+    echo " 检查结果：未检测到 ${DOMAIN} 的证书记录。"
+    echo "正在为域名 ${DOMAIN} 申请/续签证书..."
+    echo " 准备执行首次申请 (--issue)..."
+    
+    docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
+      --server "${CERT_SERVER}" \
+      --issue -d "${DOMAIN}" -d "*.${DOMAIN}" \
+      --dns "${DNS}" \
+      --log
+      
+    if [ $? -eq 0 ]; then
+        echo "✅ 全新证书申请成功！"
+        ACTION_NEEDED="deploy"
+    else
+        echo "❌ 证书申请失败，请检查上方日志的报错信息。"
+        exit 1
+    fi
+
 else
-  echo "证书申请失败，请检查上面的日志输出。"
-  exit 1
+    # -----------------------------------------------------------
+    # 分支 B：找到记录 -> 执行续签逻辑 (Renew)
+    # -----------------------------------------------------------
+    echo " 检查结果：检测到 ${DOMAIN} 已存在证书记录。"
+    echo "正在为域名 ${DOMAIN} 申请/续签证书..."
+    echo " 准备执行续签检查 (--renew)..."
+    
+    docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
+      --server "${CERT_SERVER}" \
+      --renew -d "${DOMAIN}" -d "*.${DOMAIN}" \
+      --log
+      
+    ACME_STATUS=$?
+    
+    if [ $ACME_STATUS -eq 0 ]; then
+        echo "✅ 证书已进入续签期，已成功获取新证书！"
+        ACTION_NEEDED="deploy"
+    elif [ $ACME_STATUS -eq 2 ]; then
+        echo "⏳ 当前证书有效期依然充足（剩余大于30天），acme.sh 自动跳过更新。"
+        echo " 本次任务圆满结束，脚本执行完毕，无需进一步操作。"
+        exit 0
+    else
+        echo "❌ 续签遇到错误 (状态码: ${ACME_STATUS})，请检查上面的日志输出。"
+        exit 1
+    fi
 fi
 
-echo "脚本执行完毕。"
+# 3. 部署证书到群晖
+# 检查上一步证书申请是否成功并且需要部署
+if [ "$ACTION_NEEDED" == "deploy" ]; then
+    echo "证书申请成功，准备部署到 Synology DSM..."
+    
+    docker exec \
+      -e SYNO_Username="${SYNO_Username}" \
+      -e SYNO_Password="${SYNO_Password}" \
+      -e SYNO_Hostname="${SYNO_Hostname}" \
+      -e SYNO_Scheme="${SYNO_Scheme}" \
+      -e SYNO_Port="${SYNO_Port}" \
+      -e SYNO_Certificate="${SYNO_Certificate}" \
+      -e SYNO_DID="${SYNO_Device_ID}" \
+      acme.sh acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
+      
+    if [ $? -eq 0 ]; then
+        echo " 恭喜！新证书已成功部署并应用到群晖系统！脚本执行完毕。"
+    else
+        echo "❌ 证书部署到群晖失败，请检查账号密码、Device_ID 等变量是否正确。"
+        exit 1
+    fi
+fi
