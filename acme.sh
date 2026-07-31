@@ -8,27 +8,27 @@
 # 请在群晖 DSM 依次点击：“控制面板” -> “任务计划” -> “新增” -> “计划的任务” -> “用户定义的脚本”。
 # 建议将任务的运行频率设置为：每月运行一次（例如每月 1 日凌晨 2 点）。
 #
-# 👉 【用法一：单域名默认执行】 (脚本会自动寻找同目录下的 config.conf)
+#  【用法一：单域名默认执行】 (脚本会自动去 config 文件夹下找 config.conf)
 # bash /volume1/docker/acme.sh/auto/acme.sh >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
 #
-# 👉 【用法二：多域名复用执行】 (通过后缀指定不同的配置文件，全部输出到同一个日志)
+#  【用法二：多域名复用执行】 (明确指定 config 文件夹下的各个配置文件)
 # 域名 A:
-# bash /volume1/docker/acme.sh/auto/acme.sh /volume1/docker/acme.sh/auto/config_aaa.conf >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
+# bash /volume1/docker/acme.sh/auto/acme.sh /volume1/docker/acme.sh/auto/config/config_aaa.conf >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
 # 域名 B:
-# bash /volume1/docker/acme.sh/auto/acme.sh /volume1/docker/acme.sh/auto/config_bbb.conf >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
+# bash /volume1/docker/acme.sh/auto/acme.sh /volume1/docker/acme.sh/auto/config/config_bbb.conf >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
 # ===============================================================
 
 # ===============================================================
-# 1. 动态加载外部配置文件 (支持参数传入)
+# 1. 动态加载外部配置文件 (支持参数传入，支持 config 文件夹)
 # ===============================================================
 
 # 检查执行脚本时是否附带了配置文件参数 (例如 $1 就是你传入的配置文件路径)
 if [ -n "$1" ]; then
     CONFIG_FILE="$1"
 else
-    # 如果没有参数，就默认使用脚本所在目录下的 config.conf
+    # 如果没有参数，就默认寻找当前脚本目录下 config 文件夹内的 config.conf
     SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-    CONFIG_FILE="${SCRIPT_DIR}/config.conf"
+    CONFIG_FILE="${SCRIPT_DIR}/config/config.conf"
 fi
 
 # 检查配置文件是否存在并加载
@@ -39,6 +39,7 @@ if [ -f "$CONFIG_FILE" ]; then
 else
     echo "================================================="
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ 错误: 找不到指定的配置文件 '$CONFIG_FILE'"
+    echo "请确保文件存在，且路径正确。"
     exit 1
 fi
 
@@ -80,9 +81,9 @@ if [ -z "$CHECK_EXIST" ]; then
     # -----------------------------------------------------------
     # 分支 A：未找到记录 -> 执行首次申请 (Issue)
     # -----------------------------------------------------------
-    echo "🔎 检查结果：未检测到 ${DOMAIN} 的证书记录。"
+    echo " 检查结果：未检测到 ${DOMAIN} 的证书记录。"
     echo "正在为域名 ${DOMAIN} 申请证书..."
-    echo "🚀 准备执行首次申请 (--issue)..."
+    echo " 准备执行首次申请 (--issue)..."
     
     docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
       --server "${CERT_SERVER}" \
@@ -102,9 +103,9 @@ else
     # -----------------------------------------------------------
     # 分支 B：找到记录 -> 执行续签逻辑 (Renew)
     # -----------------------------------------------------------
-    echo "🔎 检查结果：检测到 ${DOMAIN} 已存在证书记录。"
+    echo " 检查结果：检测到 ${DOMAIN} 已存在证书记录。"
     echo "正在为域名 ${DOMAIN} 检查续签状态..."
-    echo "👉 准备执行续签检查 (--renew)..."
+    echo " 准备执行续签检查 (--renew)..."
     
     docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
       --server "${CERT_SERVER}" \
@@ -118,7 +119,7 @@ else
         ACTION_NEEDED="deploy"
     elif [ $ACME_STATUS -eq 2 ]; then
         echo "⏳ 当前证书有效期依然充足（剩余大于30天），acme.sh 自动跳过更新。"
-        echo "🎉 本次任务圆满结束，脚本执行完毕，无需进一步操作。"
+        echo " 本次任务圆满结束，脚本执行完毕，无需进一步操作。"
         echo "================================================="
         exit 0
     else
@@ -146,7 +147,7 @@ if [ "$ACTION_NEEDED" == "deploy" ]; then
       acme.sh acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
       
     if [ $? -eq 0 ]; then
-        echo "🎉 恭喜！新证书已成功部署并应用到群晖系统！"
+        echo " 恭喜！新证书已成功部署并应用到群晖系统！"
     else
         echo "❌ 证书部署到群晖失败，请检查账号密码、Device_ID 等变量是否正确。"
         exit 1
