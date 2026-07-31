@@ -8,10 +8,10 @@
 # 请在群晖 DSM 依次点击：“控制面板” -> “任务计划” -> “新增” -> “计划的任务” -> “用户定义的脚本”。
 # 建议将任务的运行频率设置为：每月运行一次（例如每月 1 日凌晨 2 点）。
 #
-#  【用法一：单域名默认执行】 (脚本会自动去 config 文件夹下找 config.conf)
+#  【用法一：单域名默认执行】 (自动寻找 config 目录或同目录下的 config.conf)
 # bash /volume1/docker/acme.sh/auto/acme.sh >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
 #
-#  【用法二：多域名复用执行】 (明确指定 config 文件夹下的各个配置文件)
+#  【用法二：多域名复用执行】 (通过后缀指定不同的配置文件，全部输出到同一个日志)
 # 域名 A:
 # bash /volume1/docker/acme.sh/auto/acme.sh /volume1/docker/acme.sh/auto/config/config_aaa.conf >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
 # 域名 B:
@@ -51,7 +51,7 @@ fi
 if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
     echo "================================================="
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ 成功加载配置: $CONFIG_FILE"
+    echo "[$(date '+\%Y-\%m-\%d \%H:\%M:\%S')] ✅ 成功加载配置: $CONFIG_FILE"
     
     # 如果触发了回退机制，打印一句友好的提示日志
     if [ "$FALLBACK_TRIGGERED" = true ]; then
@@ -69,13 +69,27 @@ else
 fi
 
 # ===============================================================
-# 2. 智能执行脚本 (自动判断 Issue / Renew)
+# 2. 运行环境预检 (Pre-flight Check)
 # ===============================================================
 
-echo "开始处理域名: ${DOMAIN}"
-echo "准备执行 acme.sh 脚本..."
+# 赋默认值：如果配置文件里没写，就默认用 acme.sh
+CONTAINER_NAME="${ACME_CONTAINER_NAME:-acme.sh}"
 
-# 根据选择的DNS服务商，准备对应的环境变量，使用数组防止空格引发错误
+echo "开始处理域名: ${DOMAIN}"
+echo "正在预检 Docker 容器状态..."
+
+# 检查目标容器是否处于运行状态
+if [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null)" != "true" ]; then
+    echo "================================================="
+    echo "❌ 致命错误: 找不到名为 '${CONTAINER_NAME}' 的容器，或者该容器未处于运行状态！"
+    echo "请检查群晖 Container Manager (Docker)，确保该容器已启动。"
+    echo "================================================="
+    exit 1
+fi
+echo "✅ 容器 '${CONTAINER_NAME}' 运行正常。"
+echo "准备执行证书申请/续签逻辑..."
+
+# 根据选择的DNS服务商，准备对应的环境变量
 declare -a DNS_ENV_VARS
 case $DNS in
 "dns_cf")
@@ -100,8 +114,7 @@ esac
 ACTION_NEEDED="none"
 
 # ★ 核心判断：检查 acme.sh 内部是否已经存在该域名的配置 ★
-CHECK_EXIST=$(docker exec acme.sh acme.sh --list | grep "${DOMAIN}")
-
+CHECK_EXIST=$(docker exec "${CONTAINER_NAME}" acme.sh --list | grep "${DOMAIN}")
 if [ -z "$CHECK_EXIST" ]; then
     # -----------------------------------------------------------
     # 分支 A：未找到记录 -> 执行首次申请 (Issue)
@@ -110,7 +123,7 @@ if [ -z "$CHECK_EXIST" ]; then
     echo "正在为域名 ${DOMAIN} 申请证书..."
     echo " 准备执行首次申请 (--issue)..."
     
-    docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
+    docker exec "${DNS_ENV_VARS[@]}" "${CONTAINER_NAME}" acme.sh \
       --server "${CERT_SERVER}" \
       --issue -d "${DOMAIN}" -d "*.${DOMAIN}" \
       --dns "${DNS}" \
@@ -132,7 +145,7 @@ else
     echo "正在为域名 ${DOMAIN} 检查续签状态..."
     echo " 准备执行续签检查 (--renew)..."
     
-    docker exec "${DNS_ENV_VARS[@]}" acme.sh acme.sh \
+    docker exec "${DNS_ENV_VARS[@]}" "${CONTAINER_NAME}" acme.sh \
       --server "${CERT_SERVER}" \
       --renew -d "${DOMAIN}" -d "*.${DOMAIN}" \
       --log
@@ -169,7 +182,7 @@ if [ "$ACTION_NEEDED" == "deploy" ]; then
       -e SYNO_Port="${SYNO_Port}" \
       -e SYNO_Certificate="${SYNO_Certificate}" \
       -e SYNO_DID="${SYNO_Device_ID}" \
-      acme.sh acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
+      "${CONTAINER_NAME}" acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
       
     if [ $? -eq 0 ]; then
         echo " 恭喜！新证书已成功部署并应用到群晖系统！"
