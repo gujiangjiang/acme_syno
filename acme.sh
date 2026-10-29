@@ -6,7 +6,8 @@
 #
 # 【群晖任务计划执行指南】
 # 请在群晖 DSM 依次点击：“控制面板” -> “任务计划” -> “新增” -> “计划的任务” -> “用户定义的脚本”。
-# 建议将任务的运行频率设置为：每月运行一次（例如每月 1 日凌晨 2 点）。
+# 建议将任务的运行频率设置为：每周运行一次（例如每周一凌晨 2 点），
+# 以便证书续签后能及时把新证书同步部署到群晖，避免长期停留旧证书。
 #
 #  【用法一：单域名默认执行】 (自动寻找 config 目录或同目录下的 config.conf)
 # bash /volume1/docker/acme.sh/auto/acme.sh >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
@@ -156,10 +157,10 @@ else
         echo "✅ 证书已进入续签期，已成功获取新证书！"
         ACTION_NEEDED="deploy"
     elif [ $ACME_STATUS -eq 2 ]; then
-        echo "⏳ 当前证书有效期依然充足（剩余大于30天），acme.sh 自动跳过更新。"
-        echo " 本次任务圆满结束，脚本执行完毕，无需进一步操作。"
-        echo "================================================="
-        exit 0
+        echo "⏳ 证书尚未到续签期，acme.sh 自动跳过更新。"
+        echo "🔁 为确保群晖系统实际使用的证书与 acme.sh 内部证书保持一致"
+        echo "   （防止容器内已悄悄续签、群晖里仍在用旧证书的情况），继续执行一次部署同步。"
+        ACTION_NEEDED="deploy"
     else
         echo "❌ 续签遇到错误 (状态码: ${ACME_STATUS})，请检查上面的日志输出。"
         exit 1
@@ -185,11 +186,35 @@ if [ "$ACTION_NEEDED" == "deploy" ]; then
       "${CONTAINER_NAME}" acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
       
     if [ $? -eq 0 ]; then
-        echo " 恭喜！新证书已成功部署并应用到群晖系统！"
+        echo " 恭喜！证书已成功部署并应用到群晖系统！"
     else
         echo "❌ 证书部署到群晖失败，请检查账号密码、Device_ID 等变量是否正确。"
         exit 1
     fi
+fi
+
+# ===============================================================
+# 4. 部署后自检：输出证书真实到期时间 (安全兜底)
+# ===============================================================
+
+CERT_CHECK=$(docker exec -e "CHECK_DOMAIN=${DOMAIN}" "${CONTAINER_NAME}" sh -c '
+  for f in "/acme.sh/${CHECK_DOMAIN}_ecc/${CHECK_DOMAIN}.cer" "/acme.sh/${CHECK_DOMAIN}/${CHECK_DOMAIN}.cer"; do
+    [ -f "$f" ] || continue
+    openssl x509 -in "$f" -noout -enddate | cut -d= -f2
+    if ! openssl x509 -in "$f" -noout -checkend 2592000 >/dev/null 2>&1; then
+      echo "__EXPIRING_SOON__"
+    fi
+    break
+  done
+' 2>/dev/null)
+
+CERT_ENDDATE=$(echo "$CERT_CHECK" | grep -v "__EXPIRING_SOON__" | head -n 1)
+if [ -n "$CERT_ENDDATE" ]; then
+    echo "🕒 当前部署的证书到期时间: ${CERT_ENDDATE}"
+    echo "   (若本行日期临近或已过期，说明续签流程存在异常，请翻阅上方日志排查)"
+fi
+if echo "$CERT_CHECK" | grep -q "__EXPIRING_SOON__"; then
+    echo "⚠️ 警告: acme.sh 内部证书将在 30 天内到期，续签似乎未生效，请立即排查！"
 fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 脚本运行完毕。"
