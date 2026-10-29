@@ -254,24 +254,51 @@ fi
 if [ "$ACTION_NEEDED" == "deploy" ]; then
     echo "证书准备就绪，准备部署到 Synology DSM..."
     
+    # ★ 部署参数标准化 (重要)
+    # acme.sh 3.x 的 synology_dsm 钩子读取的是【全大写】变量名 (SYNO_HOSTNAME 等)，
+    # 旧版混合大小写变量名 (SYNO_Hostname 等) 会被忽略，导致钩子回退使用域名配置里
+    # 持久化的历史旧值（例如早已失效的旧域名，引发 curl error 6 无法解析主机名）。
+    # 因此这里：① 显式给地址/协议/端口赋默认值；② 新旧两套变量名同时传递，确保
+    # config.conf 中的配置强制生效，并在部署成功后被写回覆盖旧值。
+    SYNO_SCHEME="${SYNO_Scheme:-http}"
+    SYNO_HOSTNAME="${SYNO_Hostname:-localhost}"
+    SYNO_PORT="${SYNO_Port:-5000}"
+    echo "🔗 群晖连接地址: ${SYNO_SCHEME}://${SYNO_HOSTNAME}:${SYNO_PORT}"
+    
+    # 部署前连通性预检 (仅提醒, 不阻断后续部署)
+    if docker exec "${CONTAINER_NAME}" curl -s -o /dev/null --connect-timeout 5 "${SYNO_SCHEME}://${SYNO_HOSTNAME}:${SYNO_PORT}/webapi/query.cgi" 2>/dev/null; then
+        echo "✅ 群晖 REST API 连通性正常。"
+    else
+        echo "⚠️ 无法连接到 ${SYNO_SCHEME}://${SYNO_HOSTNAME}:${SYNO_PORT}"
+        echo "   若容器使用 bridge 网络，请将 config.conf 中的 SYNO_Hostname 改为群晖局域网 IP (如 192.168.1.10)。"
+    fi
+    
     # 先记录容器内当前证书的指纹，部署成功后写入本地记录 (校验兜底用)
     CONTAINER_CERT_FP=$(get_container_cert_fp)
     
     docker exec \
+      -e SYNO_USERNAME="${SYNO_Username}" \
+      -e SYNO_PASSWORD="${SYNO_Password}" \
+      -e SYNO_DEVICE_ID="${SYNO_Device_ID}" \
+      -e SYNO_HOSTNAME="${SYNO_HOSTNAME}" \
+      -e SYNO_SCHEME="${SYNO_SCHEME}" \
+      -e SYNO_PORT="${SYNO_PORT}" \
+      -e SYNO_CERTIFICATE="${SYNO_Certificate}" \
+      -e SYNO_DID="${SYNO_Device_ID}" \
       -e SYNO_Username="${SYNO_Username}" \
       -e SYNO_Password="${SYNO_Password}" \
-      -e SYNO_Hostname="${SYNO_Hostname}" \
-      -e SYNO_Scheme="${SYNO_Scheme}" \
-      -e SYNO_Port="${SYNO_Port}" \
+      -e SYNO_Device_ID="${SYNO_Device_ID}" \
+      -e SYNO_Hostname="${SYNO_HOSTNAME}" \
+      -e SYNO_Scheme="${SYNO_SCHEME}" \
+      -e SYNO_Port="${SYNO_PORT}" \
       -e SYNO_Certificate="${SYNO_Certificate}" \
-      -e SYNO_DID="${SYNO_Device_ID}" \
       "${CONTAINER_NAME}" acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
       
     if [ $? -eq 0 ]; then
         echo " 恭喜！证书已成功部署并应用到群晖系统！"
         save_deployed_fp "${CONTAINER_CERT_FP}"
     else
-        echo "❌ 证书部署到群晖失败，请检查账号密码、Device_ID 等变量是否正确。"
+        echo "❌ 证书部署到群晖失败，请检查上方日志以及账号密码、Device_ID、群晖地址等配置。"
         exit 1
     fi
 fi
