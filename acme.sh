@@ -6,8 +6,9 @@
 #
 # 【群晖任务计划执行指南】
 # 请在群晖 DSM 依次点击：“控制面板” -> “任务计划” -> “新增” -> “计划的任务” -> “用户定义的脚本”。
-# 建议将任务的运行频率设置为：每周运行一次（例如每周一凌晨 2 点），
-# 以便证书续签后能及时把新证书同步部署到群晖，避免长期停留旧证书。
+# 建议将任务的运行频率设置为：每月运行一次（例如每月 1 日凌晨 2 点）。
+# 证书有效期 90 天，到期前约 30 天才进入续签窗口，每月检查一次已足够；
+# 脚本每次运行都会自动比对并同步部署最新证书到群晖，无需担心遗漏。
 #
 #  【用法一：单域名默认执行】 (自动寻找 config 目录或同目录下的 config.conf)
 # bash /volume1/docker/acme.sh/auto/acme.sh >>/volume1/docker/acme.sh/auto/acmelog.txt 2>&1
@@ -76,6 +77,11 @@ fi
 # 赋默认值：如果配置文件里没写，就默认用 acme.sh
 CONTAINER_NAME="${ACME_CONTAINER_NAME:-acme.sh}"
 
+# 部署策略赋默认值：
+# smart  = 智能比对，仅当群晖中不存在与容器内一致的证书时才部署 (推荐)
+# always = 每次运行都强制执行一次部署
+DEPLOY_MODE="${DEPLOY_MODE:-smart}"
+
 echo "开始处理域名: ${DOMAIN}"
 echo "正在预检 Docker 容器状态..."
 
@@ -110,6 +116,68 @@ case $DNS in
   exit 1
   ;;
 esac
+
+# ===============================================================
+# 2.5 证书一致性比对工具函数 (供 smart 模式下"按需部署"判断使用)
+# ===============================================================
+
+# 获取容器内当前证书的 SHA256 指纹 (兼容 ECC 与 RSA 两种存放路径)
+get_container_cert_fp() {
+    docker exec -e "CHECK_DOMAIN=${DOMAIN}" "${CONTAINER_NAME}" sh -c '
+        for f in "/acme.sh/${CHECK_DOMAIN}_ecc/${CHECK_DOMAIN}.cer" "/acme.sh/${CHECK_DOMAIN}/${CHECK_DOMAIN}.cer"; do
+            [ -f "$f" ] || continue
+            openssl x509 -in "$f" -noout -fingerprint -sha256 2>/dev/null
+            break
+        done
+    ' 2>/dev/null | sed "s/^.*=//" | tr -d ":\r" | tr "A-F" "a-f"
+}
+
+# 判断给定指纹的证书是否已经存在于群晖系统中
+check_cert_deployed() {
+    local fp="$1"
+
+    # 指纹读取失败时，直接视为"未部署"，让流程继续部署以保证安全
+    if [ -z "$fp" ]; then
+        echo "⚠️ 无法读取容器内证书指纹，将直接执行部署以确保安全。"
+        return 1
+    fi
+
+    # 1. 直接扫描群晖的证书归档目录，查找完全一致的证书
+    #    (兼容 DSM 7.2 前后两种路径；任何一个路径可读即可正常比对)
+    local base_dir cert_file syno_fp scanned=0
+    for base_dir in /usr/syno/etc/certificate/_archive /usr/local/etc/certificate/_archive; do
+        [ -d "$base_dir" ] || continue
+        scanned=1
+        for cert_file in "$base_dir"/*/cert.pem; do
+            [ -f "$cert_file" ] || continue
+            syno_fp=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null | sed "s/^.*=//" | tr -d ":\r" | tr "A-F" "a-f")
+            if [ -n "$syno_fp" ] && [ "$syno_fp" = "$fp" ]; then
+                return 0
+            fi
+        done
+    done
+
+    # 群晖证书目录存在且已扫描过但未匹配 -> 判定为未部署 (确保安全)
+    if [ "$scanned" = "1" ]; then
+        return 1
+    fi
+
+    # 2. 兜底机制：群晖证书目录均不存在/不可读时，比对本脚本上次成功部署时留下的记录
+    local record_file="${SCRIPT_DIR}/config/.deployed_${DOMAIN}.fingerprint"
+    if [ -f "$record_file" ] && [ "$(cat "$record_file" 2>/dev/null | tr -d " \r\n")" = "$fp" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# 部署成功后记录本次证书指纹 (作为校验兜底)
+save_deployed_fp() {
+    local fp="$1"
+    if [ -n "$fp" ]; then
+        echo "$fp" > "${SCRIPT_DIR}/config/.deployed_${DOMAIN}.fingerprint" 2>/dev/null
+    fi
+}
 
 # 动作标记，决定最后是否需要部署到群晖
 ACTION_NEEDED="none"
@@ -157,10 +225,21 @@ else
         echo "✅ 证书已进入续签期，已成功获取新证书！"
         ACTION_NEEDED="deploy"
     elif [ $ACME_STATUS -eq 2 ]; then
-        echo "⏳ 证书尚未到续签期，acme.sh 自动跳过更新。"
-        echo "🔁 为确保群晖系统实际使用的证书与 acme.sh 内部证书保持一致"
-        echo "   （防止容器内已悄悄续签、群晖里仍在用旧证书的情况），继续执行一次部署同步。"
-        ACTION_NEEDED="deploy"
+        echo "⏳ 证书尚未到续签期，acme.sh 自动跳过在线续签。"
+        if [ "$DEPLOY_MODE" = "always" ]; then
+            echo "🔧 部署策略为 always：强制执行一次部署同步。"
+            ACTION_NEEDED="deploy"
+        else
+            echo "🔍 正在校验容器内证书是否已同步部署到群晖 DSM..."
+            CONTAINER_CERT_FP=$(get_container_cert_fp)
+            if check_cert_deployed "$CONTAINER_CERT_FP"; then
+                echo "✅ 校验通过：群晖中已存在与容器内完全一致的证书，无需重复部署。"
+            else
+                echo "⚠️ 检测到群晖当前证书与容器内证书不一致"
+                echo "   （通常是容器后台定时任务已抢先续签，或上次部署失败），自动补发部署..."
+                ACTION_NEEDED="deploy"
+            fi
+        fi
     else
         echo "❌ 续签遇到错误 (状态码: ${ACME_STATUS})，请检查上面的日志输出。"
         exit 1
@@ -175,6 +254,9 @@ fi
 if [ "$ACTION_NEEDED" == "deploy" ]; then
     echo "证书准备就绪，准备部署到 Synology DSM..."
     
+    # 先记录容器内当前证书的指纹，部署成功后写入本地记录 (校验兜底用)
+    CONTAINER_CERT_FP=$(get_container_cert_fp)
+    
     docker exec \
       -e SYNO_Username="${SYNO_Username}" \
       -e SYNO_Password="${SYNO_Password}" \
@@ -187,6 +269,7 @@ if [ "$ACTION_NEEDED" == "deploy" ]; then
       
     if [ $? -eq 0 ]; then
         echo " 恭喜！证书已成功部署并应用到群晖系统！"
+        save_deployed_fp "${CONTAINER_CERT_FP}"
     else
         echo "❌ 证书部署到群晖失败，请检查账号密码、Device_ID 等变量是否正确。"
         exit 1
@@ -194,7 +277,8 @@ if [ "$ACTION_NEEDED" == "deploy" ]; then
 fi
 
 # ===============================================================
-# 4. 部署后自检：输出证书真实到期时间 (安全兜底)
+# 4. 证书状态自检：输出证书真实到期时间 (安全兜底)
+#    无论本次是否执行了部署，都会输出当前证书信息供肉眼确认
 # ===============================================================
 
 CERT_CHECK=$(docker exec -e "CHECK_DOMAIN=${DOMAIN}" "${CONTAINER_NAME}" sh -c '
@@ -210,7 +294,7 @@ CERT_CHECK=$(docker exec -e "CHECK_DOMAIN=${DOMAIN}" "${CONTAINER_NAME}" sh -c '
 
 CERT_ENDDATE=$(echo "$CERT_CHECK" | grep -v "__EXPIRING_SOON__" | head -n 1)
 if [ -n "$CERT_ENDDATE" ]; then
-    echo "🕒 当前部署的证书到期时间: ${CERT_ENDDATE}"
+    echo "🕒 容器内当前证书到期时间: ${CERT_ENDDATE}"
     echo "   (若本行日期临近或已过期，说明续签流程存在异常，请翻阅上方日志排查)"
 fi
 if echo "$CERT_CHECK" | grep -q "__EXPIRING_SOON__"; then
