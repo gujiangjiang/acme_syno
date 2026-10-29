@@ -53,15 +53,15 @@ fi
 if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
     echo "================================================="
-    echo "[$(date '+\%Y-\%m-\%d \%H:\%M:\%S')] ✅ 成功加载配置: $CONFIG_FILE"
+    echo "[$(LC_TIME=C date '+%a %b %e %T %Z %Y')] ✅ 成功加载配置: $CONFIG_FILE"
     
     # 如果触发了回退机制，打印一句友好的提示日志
     if [ "$FALLBACK_TRIGGERED" = true ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⚠️ 提示: 未在 config 目录找到配置文件，已智能回退加载同目录下的文件。"
+        echo "[$(LC_TIME=C date '+%a %b %e %T %Z %Y')] ⚠️ 提示: 未在 config 目录找到配置文件，已智能回退加载同目录下的文件。"
     fi
 else
     echo "================================================="
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ 致命错误: 无法找到配置文件！"
+    echo "[$(LC_TIME=C date '+%a %b %e %T %Z %Y')] ❌ 致命错误: 无法找到配置文件！"
     echo "请检查以下情况之一："
     echo "1. 若您在计划任务中指定了配置文件路径，请检查该路径是否正确输入。"
     echo "2. 若您使用默认执行，请确保在以下任一位置存在配置文件："
@@ -81,6 +81,22 @@ CONTAINER_NAME="${ACME_CONTAINER_NAME:-acme.sh}"
 # smart  = 智能比对，仅当群晖中不存在与容器内一致的证书时才部署 (推荐)
 # always = 每次运行都强制执行一次部署
 DEPLOY_MODE="${DEPLOY_MODE:-smart}"
+
+# 时区对齐：自动探测群晖系统时区并传递给 acme.sh 容器，
+# 让容器内 acme.sh 的日志时间戳与本脚本完全一致（可在 config.conf 中用 TZ 手动指定）。
+CONTAINER_TZ="${TZ:-}"
+if [ -z "$CONTAINER_TZ" ]; then
+    CONTAINER_TZ=$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')
+fi
+if [ -z "$CONTAINER_TZ" ] && [ -f /etc/TZ ]; then
+    CONTAINER_TZ=$(tr -d ' \r\n' < /etc/TZ)
+fi
+
+TZ_ENV_VARS=()
+if [ -n "$CONTAINER_TZ" ]; then
+    TZ_ENV_VARS=("-e" "TZ=${CONTAINER_TZ}")
+    echo "🕐 已对齐容器时区: ${CONTAINER_TZ}"
+fi
 
 echo "开始处理域名: ${DOMAIN}"
 echo "正在预检 Docker 容器状态..."
@@ -192,7 +208,7 @@ if [ -z "$CHECK_EXIST" ]; then
     echo "正在为域名 ${DOMAIN} 申请证书..."
     echo " 准备执行首次申请 (--issue)..."
     
-    docker exec "${DNS_ENV_VARS[@]}" "${CONTAINER_NAME}" acme.sh \
+    docker exec "${DNS_ENV_VARS[@]}" "${TZ_ENV_VARS[@]}" "${CONTAINER_NAME}" acme.sh \
       --server "${CERT_SERVER}" \
       --issue -d "${DOMAIN}" -d "*.${DOMAIN}" \
       --dns "${DNS}" \
@@ -214,7 +230,7 @@ else
     echo "正在为域名 ${DOMAIN} 检查续签状态..."
     echo " 准备执行续签检查 (--renew)..."
     
-    docker exec "${DNS_ENV_VARS[@]}" "${CONTAINER_NAME}" acme.sh \
+    docker exec "${DNS_ENV_VARS[@]}" "${TZ_ENV_VARS[@]}" "${CONTAINER_NAME}" acme.sh \
       --server "${CERT_SERVER}" \
       --renew -d "${DOMAIN}" -d "*.${DOMAIN}" \
       --log
@@ -292,6 +308,7 @@ if [ "$ACTION_NEEDED" == "deploy" ]; then
       -e SYNO_Scheme="${SYNO_SCHEME}" \
       -e SYNO_Port="${SYNO_PORT}" \
       -e SYNO_Certificate="${SYNO_Certificate}" \
+      "${TZ_ENV_VARS[@]}" \
       "${CONTAINER_NAME}" acme.sh --deploy -d "${DOMAIN}" -d "*.${DOMAIN}" --deploy-hook synology_dsm --output-insecure
       
     if [ $? -eq 0 ]; then
@@ -328,5 +345,5 @@ if echo "$CERT_CHECK" | grep -q "__EXPIRING_SOON__"; then
     echo "⚠️ 警告: acme.sh 内部证书将在 30 天内到期，续签似乎未生效，请立即排查！"
 fi
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 脚本运行完毕。"
+echo "[$(LC_TIME=C date '+%a %b %e %T %Z %Y')] 脚本运行完毕。"
 echo "================================================="
